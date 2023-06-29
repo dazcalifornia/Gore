@@ -1,0 +1,29 @@
+# Compiled Object files, Static and Dynamic libs (Shared Objects)
+*.o
+*.a
+*.so
+
+# Compiled Go packages
+*.exe
+*.test
+*.prof
+
+# Compiled Go plugins
+*.dll
+*.dylib
+*.so
+
+# Generated files
+*.test
+*.out
+
+# Build output directories
+/bin/
+/pkg/
+/dist/
+/vendor/
+/.cache/
+
+# Dependency directories
+/go/
+
