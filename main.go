@@ -6,10 +6,13 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
@@ -25,6 +28,18 @@ type User struct {
 	Password string `json:"password"`
 }
 
+type SessionData struct {
+	Username string `json:"username"`
+	Verified bool   `json:"verified"`
+}
+
+type Session struct {
+	UserID string
+	Token  string
+}
+
+var sessions map[string]Session
+
 func main() {
 	// Establish Redis connection
 	rdb = redis.NewClient(&redis.Options{
@@ -33,14 +48,18 @@ func main() {
 		DB:       0,                // Use the default database
 	})
 
+	// Initialize the sessions map
+	sessions = make(map[string]Session)
+
 	// Create a new Gin router
 	router := gin.Default()
 
 	// Define the routes
 	router.POST("/users", createUserHandler)
 	router.POST("/login", loginHandler)
-  router.GET("/profile/:usernameOrEmail", profileHandler)
-  router.POST("/logout", logoutHandler)
+	router.GET("/profile/:usernameOrEmail", profileHandler)
+	router.POST("/logout", logoutHandler)
+	router.POST("/profile/update", updateProfileHandler)
 
 	// Start the server
 	log.Fatal(router.Run(":8080"))
@@ -102,7 +121,8 @@ func createUserHandler(c *gin.Context) {
 	}
 
 	// Store user details in Redis
-	err = rdb.HSet(c.Request.Context(), fmt.Sprintf("user:%s", user.UserID), map[string]interface{}{
+	err = rdb.HSet(c.Request.Context(), fmt.Sprintf("user:%s", user.UserID),
+	map[string]interface{}{
 		"userId":   user.UserID,
 		"username": user.Username,
 		"email":    user.Email,
@@ -117,8 +137,38 @@ func createUserHandler(c *gin.Context) {
 		return
 	}
 
+	// Create a new profile database if it doesn't exist
+	profileKey := fmt.Sprintf("profile:%s", user.UserID)
+	_, err = rdb.Get(c.Request.Context(), profileKey).Result()
+	if err == redis.Nil {
+		// Profile database doesn't exist, create a new one
+		err = rdb.HSet(c.Request.Context(), profileKey, map[string]interface{}{
+			"userId":        user.UserID,
+			"profilePicture": "",
+			"profileName":   "",
+			"bio":           "",
+		}).Err()
+		if err != nil {
+			// Rollback previous user and profile data
+			rdb.HDel(c.Request.Context(), "users", user.Username)
+			rdb.HDel(c.Request.Context(), "emails", user.Email)
+			rdb.Del(c.Request.Context(), fmt.Sprintf("user:%s", user.UserID))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create profile database"})
+			return
+		}
+	}
+
 	// User creation successful
 	c.JSON(http.StatusCreated, gin.H{"message": "User created successfully!"})
+}
+
+func generateToken() string {
+	token := make([]byte, 32)
+	_, err := rand.Read(token)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return base64.URLEncoding.EncodeToString(token)
 }
 
 func loginHandler(c *gin.Context) {
@@ -173,122 +223,57 @@ func loginHandler(c *gin.Context) {
 	if !comparePasswords(loginReq.Password, storedPassword) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
-	}
-
-	// Authentication successful
-	c.JSON(http.StatusOK, gin.H{"message": "Login successful!"})
-}
-
-func usernameExists(username string) (bool, error) {
-	return rdb.HExists(context.Background(), "users", username).Result()
-}
-
-func emailExists(email string) (bool, error) {
-	return rdb.HExists(context.Background(), "emails", email).Result()
-}
-
-func getUserIDByUsername(username string) (string, error) {
-	return rdb.HGet(context.Background(), "users", username).Result()
-}
-
-func getUserIDByEmail(email string) (string, error) {
-	return rdb.HGet(context.Background(), "emails", email).Result()
-}
-
-func encryptPassword(password string) (string, error) {
-	key := []byte("0123456789ABCDEF0123456789ABCDEF")
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return "", err
-	}
-
-	iv := make([]byte, aes.BlockSize)
-	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
-		return "", err
-	}
-
-	encrypted := make([]byte, aes.BlockSize+len(password))
-	stream := cipher.NewCTR(block, iv)
-	stream.XORKeyStream(encrypted[aes.BlockSize:], []byte(password))
-	copy(encrypted[:aes.BlockSize], iv)
-
-	return base64.URLEncoding.EncodeToString(encrypted), nil
-}
-
-func decryptPassword(encryptedPassword string) (string, error) {
-	key := []byte("0123456789ABCDEF0123456789ABCDEF")
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return "", err
-	}
-
-	encrypted, err := base64.URLEncoding.DecodeString(encryptedPassword)
-	if err != nil {
-		return "", err
-	}
-
-	if len(encrypted) < aes.BlockSize {
-		return "", fmt.Errorf("invalid encrypted password")
-	}
-
-	iv := encrypted[:aes.BlockSize]
-	encrypted = encrypted[aes.BlockSize:]
-
-	decrypted := make([]byte, len(encrypted))
-	stream := cipher.NewCTR(block, iv)
-	stream.XORKeyStream(decrypted, encrypted)
-
-	return string(decrypted), nil
-}
-
-func comparePasswords(password, storedPassword string) bool {
-	decryptedPassword, err := decryptPassword(storedPassword)
-	if err != nil {
-		return false
-	}
-
-	return password == decryptedPassword
-}
-
-func profileHandler(c *gin.Context) {
-	// Get the username or email from the request parameters
-	usernameOrEmail := c.Param("usernameOrEmail")
-
-	// Retrieve the user's ID using the provided username or email
-	userID, err := getUserIDByUsername(usernameOrEmail)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+	
+	// Compare the provided password with the stored password
+	if !comparePasswords(loginReq.Password, storedPassword) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
 
-	// Retrieve the user's data from Redis
-	userData, err := rdb.HGetAll(c.Request.Context(), fmt.Sprintf("user:%s", userID)).Result()
+	// Create a new session for the user
+	token := generateToken()
+	sessionData := map[string]interface{}{
+		"username": loginReq.Username,
+		"verified": "1",
+	}
+	sessionDataJSON, err := json.Marshal(sessionData)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve user data"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create session"})
 		return
 	}
 
-	// Check if the user exists
-	if len(userData) == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
-		return
-	}
+	// Store the session in Redis using the SET command
+	expiration := time.Hour * 24 * 30 // 30 days
 
-	// Remove the password from the user's data before sending the response
-	delete(userData, "password")
+// Store the session in Redis
+err = rdb.HSet(c.Request.Context(), "sessions", token, sessionDataJSON).Err()
+if err != nil {
+    c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create session"})
+    return
+}
 
-	// Return the user's profile data
-	c.JSON(http.StatusOK, userData)
+
+	// Return the session token to the client
+	c.JSON(http.StatusOK, gin.H{"token": token})
 }
 
 func logoutHandler(c *gin.Context) {
-	// Get the user's ID from the authentication token or session
-	//userID := getCurrentUserID(c)
+	// Get the token from the request header
+	token := c.GetHeader("Authorization")
 
-	// Perform any necessary logout operations (e.g., clearing authentication token, session, etc.)
+	// Check if the token is valid
+	if token == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid token"})
+		return
+	}
 
-	// Return a success message
-	c.JSON(http.StatusOK, gin.H{"message": "Logout successful!"})
+	// Delete the session from Redis
+	err := rdb.Del(c.Request.Context(), "session:"+token).Err()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete session"})
+		return
+	}
+
+	// Logout successful
+	c.JSON(http.StatusOK, gin.H{"message": "Logout successful"})
 }
-
-
